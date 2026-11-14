@@ -1,0 +1,986 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Android SDK lisanslari
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+
+      - name: Proje dosyalarini olustur
+        run: |
+          set -e
+          rm -rf _proj
+          mkdir -p _proj
+          cd _proj
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'__EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "BrawlBot"
+          include(":app")
+          __EOF__
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'__EOF__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __EOF__
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'__EOF__'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          __EOF__
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'__EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.mertjr.brawlbot"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.mertjr.brawlbot"
+                  minSdk = 30
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("com.google.mlkit:text-recognition:16.0.1")
+              implementation("com.google.android.gms:play-services-tasks:18.2.0")
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <queries>
+                  <package android:name="com.supercell.brawlstars" />
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".BotService"
+                      android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/res/xml/accessibility_config.xml')"
+          cat > 'app/src/main/res/xml/accessibility_config.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canPerformGestures="true"
+              android:canTakeScreenshot="true"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100"
+              android:description="@string/servis_aciklama" />
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">BrawlBot</string>
+              <string name="servis_aciklama">Ekrani okur ve oyun icin dokunma hareketleri yapar.</string>
+          </resources>
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/mertjr/brawlbot/Config.kt')"
+          cat > 'app/src/main/java/com/mertjr/brawlbot/Config.kt' <<'__EOF__'
+          package com.mertjr.brawlbot
+
+          import android.graphics.Color
+
+          /** x, y: 1'den kucukse ekran orani (0.5 = ortasi), buyukse piksel */
+          data class P(val x: Float, val y: Float)
+
+          class Stroke(val x1: Float, val y1: Float, val x2: Float, val y2: Float)
+
+          /**
+           * AYARLAR. Kalibrasyon yaptiktan sonra buradaki degerleri duzenle.
+           * (GitHub'da dosyayi ac, kalem simgesi -> duzenle -> Commit. Yeni APK otomatik derlenir.)
+           */
+          object Config {
+              const val PKG = "com.supercell.brawlstars"
+              const val KUPA_LIMIT = 1000                 // karakter bu kupaya gelince degisir
+              const val MAC_LIMIT = 10                    // OCR kupayi okuyamazsa kac macta bir degissin
+              const val DROP_ARALIK_MS = 5 * 60 * 1000L   // Starr Drop kontrol araligi
+              const val ESIK = 70f                        // renk toleransi
+
+              // Butonlar (oyun yataydayken)
+              val JOY = P(0.12f, 0.75f)       // sol alt joystick
+              val ATK = P(0.88f, 0.78f)       // sag alt saldiri
+              val SUPER = P(0.80f, 0.62f)     // super butonu
+              val OYNA = P(0.88f, 0.90f)      // lobideki sari OYNA
+              val DEVAM = P(0.50f, 0.92f)     // sonuc ekrani devam
+              val ORTA = P(0.50f, 0.50f)
+              val KAPAT = P(0.95f, 0.07f)     // pop-up kapat
+              val STARR = P(0.06f, 0.55f)     // lobideki Starr Drop simgesi
+              val BRAWLERS = P(0.08f, 0.88f)  // karakterler menusu
+              val SEC = P(0.17f, 0.88f)       // karakter sec butonu
+
+              // Karakterin kupa yazisi: x, y, genislik, yukseklik (oran)
+              val KUPA_BOLGE = floatArrayOf(0.02f, 0.80f, 0.14f, 0.08f)
+
+              // Karakter listesi ilk sayfa (kartlara sirayla basilir)
+              const val GRID_SUTUN = 5
+              const val GRID_SATIR = 3
+              const val GRID_X0 = 0.38f
+              const val GRID_Y0 = 0.28f
+              const val GRID_DX = 0.12f
+              const val GRID_DY = 0.22f
+
+              // Renkler
+              val GAZ: Int = Color.parseColor("#3FD14A")
+              val RAKIP: Int = Color.parseColor("#E8293A")
+              val SARI: Int = Color.parseColor("#FFC800")
+              val STARR_RENK: Int = Color.parseColor("#FFD84A")
+              val ATK_RENK: Int = Color.parseColor("#E03A2E")
+
+              val KARTLAR: List<P> = run {
+                  val l = ArrayList<P>()
+                  for (r in 0 until GRID_SATIR) for (c in 0 until GRID_SUTUN) {
+                      l.add(P(GRID_X0 + c * GRID_DX, GRID_Y0 + r * GRID_DY))
+                  }
+                  l
+              }
+
+              val NOKTALAR: Map<String, P> = linkedMapOf(
+                  "JOY" to JOY, "ATK" to ATK, "SUPER" to SUPER, "OYNA" to OYNA,
+                  "DEVAM" to DEVAM, "STARR" to STARR, "BRAWLERS" to BRAWLERS, "SEC" to SEC
+              )
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/mertjr/brawlbot/MainActivity.kt')"
+          cat > 'app/src/main/java/com/mertjr/brawlbot/MainActivity.kt' <<'__EOF__'
+          package com.mertjr.brawlbot
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              private lateinit var durum: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad, pad, pad)
+
+                  durum = TextView(this)
+                  durum.textSize = 16f
+                  root.addView(durum)
+
+                  fun btn(t: String, f: () -> Unit) {
+                      val b = Button(this)
+                      b.text = t
+                      b.setOnClickListener { f() }
+                      root.addView(b)
+                  }
+
+                  btn("0) Kisitli ayarlara izin ver (uygulama bilgisi)") {
+                      startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+                  }
+                  btn("1) Erisilebilirlik ayarlarini ac") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  btn("2) Brawl Stars'i ac") {
+                      val i = packageManager.getLaunchIntentForPackage(Config.PKG)
+                      if (i != null) startActivity(i)
+                  }
+
+                  val bilgi = TextView(this)
+                  bilgi.textSize = 14f
+                  bilgi.text = "\nKurulum:\n" +
+                      "0) Android 13+ ise: acilan sayfada sag ustteki 3 noktadan 'Kisitli ayarlara izin ver'.\n" +
+                      "1) Erisilebilirlik > Yuklu uygulamalar > BrawlBot > ac.\n" +
+                      "2) Oyunu ac, Showdown'u sec, lobide dur.\n" +
+                      "3) Ekranin sol ustunde kucuk panel cikar:\n" +
+                      "   KALIB. = renkleri/koordinatlari gosterir (once bunu dene)\n" +
+                      "   BASLAT = botu calistirir, DURDUR = durdurur.\n" +
+                      "4) Ayarlar GitHub'daki Config.kt dosyasinda."
+                  root.addView(bilgi)
+
+                  val sv = ScrollView(this)
+                  sv.addView(root)
+                  setContentView(sv)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val en = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+                  durum.text = if (en.contains(packageName)) {
+                      "Servis ACIK. Oyuna gec, panel sol ustte."
+                  } else {
+                      "Servis KAPALI. Asagidaki adimlari uygula."
+                  }
+              }
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/mertjr/brawlbot/BotService.kt')"
+          cat > 'app/src/main/java/com/mertjr/brawlbot/BotService.kt' <<'__EOF__'
+          package com.mertjr.brawlbot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.AccessibilityService.GestureResultCallback
+          import android.accessibilityservice.AccessibilityService.ScreenshotResult
+          import android.accessibilityservice.AccessibilityService.TakeScreenshotCallback
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.Log
+          import android.view.Display
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
+
+          class BotService : AccessibilityService() {
+
+              @Volatile var currentPkg: String = ""
+
+              private val exec = Executors.newSingleThreadExecutor()
+              private val main = Handler(Looper.getMainLooper())
+              private var lastShot = 0L
+
+              private var brain: Brain? = null
+              private var thread: Thread? = null
+
+              private var box: LinearLayout? = null
+              private var logView: TextView? = null
+              private var b1: Button? = null
+              private var b2: Button? = null
+              private val lines = ArrayList<String>()
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  buildOverlay()
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+                  if (e == null) return
+                  if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                      val p = e.packageName?.toString() ?: return
+                      if (p == packageName || p == "com.android.systemui") return
+                      if (p.contains("inputmethod") || p.contains("keyboard")) return
+                      currentPkg = p
+                  }
+              }
+
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  stopBot()
+                  try {
+                      val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                      val bx = box
+                      if (bx != null) wm.removeView(bx)
+                  } catch (e: Exception) {
+                  }
+                  super.onDestroy()
+              }
+
+              // ---------- Overlay ----------
+              private fun buildOverlay() {
+                  val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val panel = LinearLayout(this)
+                  panel.orientation = LinearLayout.VERTICAL
+                  panel.setBackgroundColor(0x88000000.toInt())
+
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+
+                  val a = Button(this)
+                  a.text = "BASLAT"
+                  a.textSize = 10f
+                  a.minHeight = 0
+                  a.minimumHeight = 0
+                  a.setOnClickListener { toggle(false) }
+
+                  val c = Button(this)
+                  c.text = "KALIB."
+                  c.textSize = 10f
+                  c.minHeight = 0
+                  c.minimumHeight = 0
+                  c.setOnClickListener { toggle(true) }
+
+                  row.addView(a)
+                  row.addView(c)
+
+                  val tv = TextView(this)
+                  tv.textSize = 9f
+                  tv.setTextColor(Color.WHITE)
+                  tv.maxLines = 10
+
+                  panel.addView(row)
+                  panel.addView(tv)
+
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  wm.addView(panel, lp)
+
+                  box = panel
+                  logView = tv
+                  b1 = a
+                  b2 = c
+              }
+
+              private fun updateButtons() {
+                  val calisiyor = thread?.isAlive == true
+                  main.post {
+                      b1?.text = if (calisiyor) "DURDUR" else "BASLAT"
+                      b2?.text = if (calisiyor) "DURDUR" else "KALIB."
+                  }
+              }
+
+              fun log(m: String) {
+                  Log.d("BrawlBot", m)
+                  val t = synchronized(lines) {
+                      lines.add(m)
+                      while (lines.size > 6) lines.removeAt(0)
+                      lines.joinToString("\n")
+                  }
+                  main.post { logView?.text = t }
+              }
+
+              fun setLines(l: List<String>) {
+                  val t = l.joinToString("\n")
+                  main.post { logView?.text = t }
+              }
+
+              // ---------- Bot kontrol ----------
+              private fun toggle(kalibrasyon: Boolean) {
+                  if (thread?.isAlive == true) {
+                      stopBot()
+                      return
+                  }
+                  val rootPkg = rootInActiveWindow?.packageName?.toString()
+                  if (rootPkg != null && rootPkg != packageName) currentPkg = rootPkg
+                  val b = Brain(this)
+                  b.calibrate = kalibrasyon
+                  b.running = true
+                  brain = b
+                  val t = Thread { b.loop() }
+                  thread = t
+                  t.start()
+                  updateButtons()
+              }
+
+              fun stopBot() {
+                  brain?.running = false
+                  thread?.interrupt()
+                  thread = null
+                  updateButtons()
+              }
+
+              fun onBrainStopped() {
+                  main.post { b1?.text = "BASLAT"; b2?.text = "KALIB." }
+              }
+
+              // ---------- Ekran goruntusu ----------
+              fun shot(): Bitmap? {
+                  val bekle = 400 - (System.currentTimeMillis() - lastShot)
+                  if (bekle > 0) Thread.sleep(bekle)
+                  lastShot = System.currentTimeMillis()
+
+                  val latch = CountDownLatch(1)
+                  var out: Bitmap? = null
+                  takeScreenshot(Display.DEFAULT_DISPLAY, exec, object : TakeScreenshotCallback {
+                      override fun onSuccess(r: ScreenshotResult) {
+                          try {
+                              val hw = Bitmap.wrapHardwareBuffer(r.hardwareBuffer, r.colorSpace)
+                              if (hw != null) {
+                                  out = hw.copy(Bitmap.Config.ARGB_8888, false)
+                                  hw.recycle()
+                              }
+                          } catch (e: Exception) {
+                          }
+                          try {
+                              r.hardwareBuffer.close()
+                          } catch (e: Exception) {
+                          }
+                          latch.countDown()
+                      }
+
+                      override fun onFailure(errorCode: Int) {
+                          latch.countDown()
+                      }
+                  })
+                  latch.await(3, TimeUnit.SECONDS)
+                  return out
+              }
+
+              // ---------- Dokunma ----------
+              fun gesture(strokes: List<Stroke>, ms: Long, bekle: Boolean) {
+                  val b = GestureDescription.Builder()
+                  for (st in strokes.take(10)) {
+                      val p = Path()
+                      p.moveTo(st.x1, st.y1)
+                      if (st.x1 != st.x2 || st.y1 != st.y2) p.lineTo(st.x2, st.y2)
+                      b.addStroke(GestureDescription.StrokeDescription(p, 0, ms))
+                  }
+                  val latch = CountDownLatch(1)
+                  val ok = dispatchGesture(b.build(), object : GestureResultCallback() {
+                      override fun onCompleted(g: GestureDescription?) {
+                          latch.countDown()
+                      }
+
+                      override fun onCancelled(g: GestureDescription?) {
+                          latch.countDown()
+                      }
+                  }, null)
+                  if (ok && bekle) latch.await(ms + 1500, TimeUnit.MILLISECONDS)
+              }
+
+              fun back() {
+                  performGlobalAction(GLOBAL_ACTION_BACK)
+              }
+
+              fun openGame() {
+                  val i = packageManager.getLaunchIntentForPackage(Config.PKG) ?: return
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  startActivity(i)
+              }
+          }
+          __EOF__
+          mkdir -p "$(dirname 'app/src/main/java/com/mertjr/brawlbot/Brain.kt')"
+          cat > 'app/src/main/java/com/mertjr/brawlbot/Brain.kt' <<'__EOF__'
+          package com.mertjr.brawlbot
+
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import com.google.android.gms.tasks.Tasks
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+          import java.util.concurrent.TimeUnit
+          import kotlin.math.PI
+          import kotlin.math.abs
+          import kotlin.math.cos
+          import kotlin.math.hypot
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+          import kotlin.random.Random
+
+          /** Botun beyni: ekrani okur, karar verir, BotService ile dokunur. */
+          class Brain(private val s: BotService) {
+
+              @Volatile var running = false
+              var calibrate = false
+
+              private class Mass(val n: Int, val vx: Float, val vy: Float)
+
+              private var bmp: Bitmap? = null
+              private var W = 1
+              private var H = 1
+
+              private var yon = Pair(1f, 0f)
+              private var yonBitis = 0L
+              private var strafe = 1f
+              private var strafeBitis = 0L
+              private var sonSuper = 0L
+              private var takildi = 0
+              private var serbestBitis = 0L
+              private var oncekiImza: IntArray? = null
+
+              private var macSayisi = 0
+              private var kupaKontrol = false
+              private var sonDrop = 0L
+              private var oynaZamani = 0L
+              private var kartIdx = -1
+              private var sonDegisimMac = 0
+              private var macte = false
+              private var macDisi = 0
+              private var bilinmeyen = 0
+              private var disarida = 0
+
+              private val tiklama = listOf(Config.DEVAM, Config.KAPAT, Config.ORTA)
+              private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+
+              // ---------- yardimcilar ----------
+              private fun log(m: String) = s.log(m)
+              private fun sl(ms: Long) = Thread.sleep(ms)
+              private fun nx(p: P): Float = if (p.x <= 1f) p.x * W else p.x
+              private fun ny(p: P): Float = if (p.y <= 1f) p.y * H else p.y
+              private fun jit(v: Float, n: Float): Float = v + (Random.nextFloat() * 2f - 1f) * n
+
+              private fun tap(p: P) {
+                  val x = jit(nx(p), 6f)
+                  val y = jit(ny(p), 6f)
+                  s.gesture(listOf(Stroke(x, y, x, y)), (60 + Random.nextInt(60)).toLong(), true)
+              }
+
+              private fun pixAt(x: Float, y: Float): Int {
+                  val b = bmp ?: return 0
+                  return b.getPixel(x.toInt().coerceIn(0, b.width - 1), y.toInt().coerceIn(0, b.height - 1))
+              }
+
+              private fun pix(p: P): Int = pixAt(nx(p), ny(p))
+
+              private fun benzer(c1: Int, c2: Int): Boolean {
+                  val dr = Color.red(c1) - Color.red(c2)
+                  val dg = Color.green(c1) - Color.green(c2)
+                  val db = Color.blue(c1) - Color.blue(c2)
+                  return sqrt((dr * dr + dg * dg + db * db).toFloat()) <= Config.ESIK
+              }
+
+              private fun refresh(): Boolean {
+                  val b = s.shot() ?: return false
+                  val eski = bmp
+                  bmp = b
+                  W = b.width
+                  H = b.height
+                  eski?.recycle()
+                  return true
+              }
+
+              private fun oran(x1: Float, y1: Float, x2: Float, y2: Float, renk: Int): Float {
+                  var t = 0
+                  var e = 0
+                  for (i in 0 until 8) for (j in 0 until 5) {
+                      val x = W * (x1 + (x2 - x1) * i / 7f)
+                      val y = H * (y1 + (y2 - y1) * j / 4f)
+                      t++
+                      if (benzer(pixAt(x, y), renk)) e++
+                  }
+                  return e.toFloat() / t
+              }
+
+              private fun lobiMi(): Boolean = oran(0.80f, 0.86f, 0.96f, 0.95f, Config.SARI) > 0.5f
+              private fun macMi(): Boolean = benzer(pix(Config.ATK), Config.ATK_RENK)
+
+              private fun norm(x: Float, y: Float): Pair<Float, Float> {
+                  var n = hypot(x, y)
+                  if (n == 0f) n = 1f
+                  return Pair(x / n, y / n)
+              }
+
+              // ---------- mac ici ----------
+              private fun yasak(x: Float, y: Float): Boolean {
+                  if (y < H * 0.12f) return true
+                  if (x < W * 0.25f && y > H * 0.55f) return true
+                  if (x > W * 0.68f && y > H * 0.5f) return true
+                  if (abs(x - W / 2f) < W * 0.07f && abs(y - H / 2f) < H * 0.14f) return true
+                  return false
+              }
+
+              private fun tara(renk: Int): Mass? {
+                  var vx = 0f
+                  var vy = 0f
+                  var n = 0
+                  val cx = W / 2f
+                  val cy = H / 2f
+                  for (i in 0 until 40) for (j in 0 until 20) {
+                      val gx = W * i / 40f
+                      val gy = H * j / 20f
+                      if (yasak(gx, gy)) continue
+                      if (benzer(pixAt(gx, gy), renk)) {
+                          vx += gx - cx
+                          vy += gy - cy
+                          n++
+                      }
+                  }
+                  return if (n == 0) null else Mass(n, vx / n, vy / n)
+              }
+
+              private fun imza(): IntArray {
+                  val a = IntArray(15 * 8)
+                  var k = 0
+                  for (i in 1 until 16) for (j in 1 until 9) {
+                      a[k++] = Color.green(pixAt(W * i / 16f, H * j / 9f))
+                  }
+                  return a
+              }
+
+              private fun fark(a: IntArray, b: IntArray): Float {
+                  var t = 0
+                  for (i in a.indices) t += abs(a[i] - b[i])
+                  return t.toFloat() / a.size
+              }
+
+              /** hareket + nisan + super ayni anda (coklu dokunus) */
+              private fun eylem(d: Pair<Float, Float>?, ms: Long, nisan: Pair<Float, Float>?, sup: Boolean, bekle: Boolean) {
+                  val r = H * 0.12f
+                  val st = ArrayList<Stroke>()
+                  val jx = nx(Config.JOY)
+                  val jy = ny(Config.JOY)
+                  val ax = nx(Config.ATK)
+                  val ay = ny(Config.ATK)
+                  if (d != null) st.add(Stroke(jit(jx, 4f), jit(jy, 4f), jx + d.first * r, jy + d.second * r))
+                  if (nisan != null) st.add(Stroke(ax, ay, ax + nisan.first * r, ay + nisan.second * r))
+                  if (sup && nisan != null) {
+                      val sx = nx(Config.SUPER)
+                      val sy = ny(Config.SUPER)
+                      st.add(Stroke(sx, sy, sx + nisan.first * r, sy + nisan.second * r))
+                  }
+                  if (st.isEmpty()) {
+                      sl(ms)
+                      return
+                  }
+                  s.gesture(st, ms, bekle)
+              }
+
+              private fun macAdimi() {
+                  val gaz = tara(Config.GAZ)
+                  val rk = tara(Config.RAKIP)
+                  val superHazir = benzer(pix(Config.SUPER), Config.SARI)
+                  val im = imza()
+                  val onc = oncekiImza
+                  if (onc != null && fark(im, onc) < 2.5f) takildi++ else takildi = 0
+                  oncekiImza = im
+                  val simdi = System.currentTimeMillis()
+
+                  // 1. Gazdan kac
+                  if (gaz != null && gaz.n >= 6) {
+                      eylem(norm(-gaz.vx, -gaz.vy), 450, null, false, false)
+                      return
+                  }
+
+                  // 2. Takildiysan rastgele yone cik
+                  if (takildi >= 6) {
+                      yon = norm(Random.nextFloat() * 2f - 1f, Random.nextFloat() * 2f - 1f)
+                      serbestBitis = simdi + 1200
+                      takildi = 0
+                  }
+                  if (simdi < serbestBitis) {
+                      eylem(yon, 450, null, false, false)
+                      return
+                  }
+
+                  // 3. Rakip var
+                  if (rk != null && rk.n >= 2) {
+                      val dx = rk.vx
+                      val dy = rk.vy + H * 0.05f
+                      val dist = hypot(dx, dy)
+                      val d = norm(dx, dy)
+                      val mv: Pair<Float, Float> = when {
+                          rk.n > 14 -> norm(-d.first, -d.second)       // cok yakin / kalabalik: geri cekil
+                          dist > W * 0.30f -> d                        // uzak: yaklas
+                          else -> {
+                              if (simdi > strafeBitis) {
+                                  strafe = -strafe
+                                  strafeBitis = simdi + 800 + Random.nextInt(900)
+                              }
+                              val t = if (dist > W * 0.20f) 0.4f else -0.4f
+                              norm(-d.second * strafe + d.first * t, d.first * strafe + d.second * t)
+                          }
+                      }
+                      val ates = dist < W * 0.38f
+                      val sup = ates && superHazir && simdi - sonSuper > 3000
+                      if (sup) sonSuper = simdi
+                      eylem(mv, 450, if (ates) d else null, sup, false)
+                      return
+                  }
+
+                  // 4. Kimse yok: gez, ara sira kutulara vur
+                  if (simdi > yonBitis) {
+                      val a = Random.nextDouble() * 2.0 * PI
+                      yon = Pair(cos(a).toFloat(), sin(a).toFloat())
+                      yonBitis = simdi + 1500 + Random.nextInt(2000)
+                  }
+                  val nis = if (Random.nextFloat() < 0.3f) yon else null
+                  eylem(yon, 450, nis, false, false)
+              }
+
+              // ---------- lobi ----------
+              private fun ocr(b: Bitmap): String? {
+                  return try {
+                      val img = InputImage.fromBitmap(b, 0)
+                      Tasks.await(recognizer.process(img), 5, TimeUnit.SECONDS).text
+                  } catch (e: InterruptedException) {
+                      throw e
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              private fun kupaOku(): Int? {
+                  if (!refresh()) return null
+                  val b = bmp ?: return null
+                  val r = Config.KUPA_BOLGE
+                  val x = (b.width * r[0]).toInt()
+                  val y = (b.height * r[1]).toInt()
+                  val w = (b.width * r[2]).toInt().coerceAtMost(b.width - x)
+                  val h = (b.height * r[3]).toInt().coerceAtMost(b.height - y)
+                  if (w <= 0 || h <= 0) return null
+                  val kes = Bitmap.createBitmap(b, x, y, w, h)
+                  val buyuk = Bitmap.createScaledBitmap(kes, w * 3, h * 3, true)
+                  val metin = ocr(buyuk) ?: return null
+                  val m = Regex("\\d{2,4}").find(metin.replace('O', '0').replace('o', '0')) ?: return null
+                  return m.value.toInt()
+              }
+
+              private fun lobiyeDon(): Boolean {
+                  for (i in 0 until 4) {
+                      if (refresh() && lobiMi()) return true
+                      s.back()
+                      sl(1200)
+                  }
+                  return false
+              }
+
+              private fun karakterDegistir() {
+                  log("Karakter degisiyor")
+                  for (d in Config.KARTLAR.indices) {
+                      tap(Config.BRAWLERS); sl(2000)
+                      kartIdx = (kartIdx + 1) % Config.KARTLAR.size
+                      tap(Config.KARTLAR[kartIdx]); sl(1500)
+                      tap(Config.SEC); sl(2000)
+                      lobiyeDon()
+                      val k = kupaOku()
+                      log("Yeni karakter kupa: $k")
+                      if (k == null || k < Config.KUPA_LIMIT) {
+                          sonDegisimMac = macSayisi
+                          return
+                      }
+                  }
+                  log("Hepsi limitte, durdum")
+                  running = false
+              }
+
+              private fun degisimGerek(): Boolean {
+                  val k = kupaOku()
+                  if (k != null) {
+                      log("Kupa: $k")
+                      return k >= Config.KUPA_LIMIT
+                  }
+                  return macSayisi - sonDegisimMac >= Config.MAC_LIMIT
+              }
+
+              private fun dropAc() {
+                  log("Starr Drop aciliyor")
+                  tap(Config.STARR); sl(2000)
+                  for (i in 0 until 10) {
+                      tap(Config.ORTA); sl(900)
+                  }
+                  tap(Config.DEVAM); sl(1500)
+                  lobiyeDon()
+              }
+
+              private fun lobiIsle() {
+                  val simdi = System.currentTimeMillis()
+                  if (simdi - oynaZamani < 8000) {
+                      sl(800)
+                      return
+                  }
+                  if (kupaKontrol) {
+                      kupaKontrol = false
+                      if (degisimGerek()) {
+                          karakterDegistir()
+                          return
+                      }
+                  }
+                  if (simdi - sonDrop > Config.DROP_ARALIK_MS) {
+                      sonDrop = simdi
+                      if (refresh() && benzer(pix(Config.STARR), Config.STARR_RENK)) {
+                          dropAc()
+                          return
+                      }
+                  }
+                  tap(Config.OYNA)
+                  oynaZamani = System.currentTimeMillis()
+                  log("Maca giriliyor")
+                  sl(1500)
+              }
+
+              private fun macBitti() {
+                  macte = false
+                  macSayisi++
+                  kupaKontrol = true
+                  log("Mac bitti. Toplam: $macSayisi")
+              }
+
+              // ---------- kalibrasyon ----------
+              private fun kalibrasyon() {
+                  val l = ArrayList<String>()
+                  l.add("lobi=${lobiMi()} mac=${macMi()}  ${W}x$H")
+                  l.add("gaz=${tara(Config.GAZ)?.n ?: 0} rakip=${tara(Config.RAKIP)?.n ?: 0}")
+                  for ((ad, p) in Config.NOKTALAR) {
+                      l.add(ad + "=" + String.format("#%06X", pix(p) and 0xFFFFFF))
+                  }
+                  s.setLines(l)
+                  sl(2000)
+              }
+
+              // ---------- ana dongu ----------
+              private fun step() {
+                  if (!refresh()) {
+                      sl(400)
+                      return
+                  }
+                  if (calibrate) {
+                      kalibrasyon()
+                      return
+                  }
+                  if (s.currentPkg != Config.PKG) {
+                      disarida++
+                      if (disarida >= 3) {
+                          log("Oyun aciliyor")
+                          s.openGame()
+                          sl(15000)
+                          disarida = 0
+                          macte = false
+                      }
+                      sl(1000)
+                      return
+                  }
+                  disarida = 0
+
+                  val lobi = lobiMi()
+                  if (!lobi && macMi()) {
+                      macte = true
+                      macDisi = 0
+                      bilinmeyen = 0
+                      macAdimi()
+                      return
+                  }
+                  if (lobi) {
+                      bilinmeyen = 0
+                      if (macte) macBitti()
+                      lobiIsle()
+                  } else {
+                      if (macte) {
+                          macDisi++
+                          if (macDisi >= 4) macBitti()
+                      }
+                      bilinmeyen++
+                      if (bilinmeyen > 6) tap(tiklama[bilinmeyen % tiklama.size])
+                      sl(1000)
+                  }
+              }
+
+              fun loop() {
+                  log(if (calibrate) "Kalibrasyon modu" else "Bot basladi")
+                  try {
+                      while (running) {
+                          try {
+                              step()
+                          } catch (e: InterruptedException) {
+                              break
+                          } catch (e: Exception) {
+                              log("Hata: ${e.message}")
+                              try {
+                                  Thread.sleep(500)
+                              } catch (x: InterruptedException) {
+                                  break
+                              }
+                          }
+                      }
+                  } finally {
+                      s.onBrainStopped()
+                  }
+              }
+          }
+          __EOF__
+          if [ -f "$GITHUB_WORKSPACE/Config.kt" ]; then
+            cp "$GITHUB_WORKSPACE/Config.kt" app/src/main/java/com/mertjr/brawlbot/Config.kt
+            echo "Ozel Config.kt kullanildi"
+          fi
+          find . -type f | sort
+
+      - name: APK derle
+        working-directory: _proj
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bot-apk
+          path: _proj/app/build/outputs/apk/debug/*.apk
